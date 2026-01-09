@@ -1,0 +1,261 @@
+0. Ubuntu SSH 서버 설치 
+apt-get update
+apt install –y net-tools
+
+dpkg –l ssh*
+apt install –y openssh-server
+nano /etc/ssh/sshd_config 
+   Port 22
+
+systemctl start ssh
+systemctl status ssh 
+systemctl enable ssh 
+
+
+1. (All nodes) 설치 전 준비 사항 
+
+1.1 시간 동기화
+timedatectl set-ntp true
+systemctl restart systemd-timesyncd
+timedatectl status
+
+1.2 Swap 비활성화
+swapoff -a
+swapon --show
+modprobe overlay          
+modprobe br_netfilter
+
+------------------------------------------
+Swap 영구 비활성화
+nano /etc/fstab
+   /swapfile 혹은 UUID= ==> 주석처리 
+----------------------------------------------
+
+
+1.3 리눅스 커널 모듈(overlay 모듈)을 로드하는 명령 
+tee /etc/modules-load.d/k8s.conf <<EOF
+overlay
+br_netfilter
+EOF
+
+1.4 Kubernetes용 네트워크 커널 파라미터 설정, 리눅스 시스템이 패킷 전달(포워딩) 기능 활성화
+nano /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables=1
+net.bridge.bridge-nf-call-ip6tables=1
+net.ipv4.ip_forward=1
+
+1.5 모든 sysctl 설정 파일을 커널 파라미터를 적용
+sysctl --system
+
+
+2. (All nodes) 도커 설치
+
+2.1 Docker에 필요한 툴 설치
+  apt-get update
+  apt-get install -y ca-certificates curl software-properties-common apt-transport-https gnupg lsb-release
+
+2.2 도커 GPG key와 저장소 지정   
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  apt update
+
+2.3  Docker Engine 설치 
+  apt install docker-ce docker-ce-cli containerd.io
+
+*docker-ce (Docker Community Edition) :  Docker 엔진, 컨테이너 관리, API 제공
+*docker-ce-cli  : Docker 명령어 도구
+*containerd.io : 컨테이너 실행
+
+2.4 Docker 활성화 
+  systemctl enable docker
+  systemctl start docker
+  docker version
+
+
+2.5  containerd 런타임의 기본 설정 파일 생성
+mkdir /etc/containerd
+sh -c "containerd config default > /etc/containerd/config.toml"
+sed -i 's/ SystemdCgroup = false/ SystemdCgroup = true/' /etc/containerd/config.toml
+systemctl restart containerd.service
+systemctl status containerd.service
+
+*containerd
+   - 컨테이너 런타임(Runtime)
+   - 컨테이너를 실제로 생성, 실행, 중지, 삭제 
+   
+----------------------------------------
+
+3.(All nodes)  Kubeadm, kubectl, kubelet 설치
+
+3.1 K8S GPG key와 저장소 지정 
+apt-get install curl ca-certificates apt-transport-https  -y
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+*Docker 공식 공개키 등록하는 과정
+  - 공개키(GPG key)를 가져와 시스템에 등록 : curl -fsSL https
+  - Docker의 GPG 공개키를 읽을 수 있도록 권한 변경(저장소서명 검증이 정상적으로 동작하도록 설정) : chmod a+r
+
+
+3.2  Kubeadm, kubectl, kubelet 설치
+apt update
+apt install kubelet kubeadm kubectl -y
+apt-mark hold kubelet kubeadm kubectl
+
+*kubeadm	Kubernetes 클러스터 설치 및 초기 구성 도구	
+*kubelet	각 노드에서 Pod를 실제로 실행·관리하는 에이전트	
+*kubectl	클러스터를 제어하는 사용자 명령 인터페이스(CLI)
+
+3.3 K8S 서비스 활성화
+systemctl daemon-reload
+systemctl restart kubelet
+systemctl enable kubelet
+
+------------------------------------------------------------
+4. [Master]  Kubeadmn을 이용한 cluster 구성
+
+4.1  마스터 노드 초기화
+kubeadm init --pod-network-cidr=192.168.0.0/16
+
+<<이전 설정값으로 초기화 시 >>
+kubeadm reset -f
+rm -rf /etc/Kubernetes
+rm -rf /var/lib/etcd
+rm -rf $HOME/.kube
+rm -f /etc/kubernetes/pki/ca.crt
+
+4.2 Kubernetes 관리자 계정(kubectl)이 클러스터에 접근할 수 있도록 인증 설정을 연결하는 과정
+mkdir -p $HOME/.kube
+cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+chown $(id -u):$(id -g) $HOME/.kube/config
+
+<<확인명령어>>
+kubectl get nodes 
+
+----------------------------------------------------------------------------
+4.3 생성된 토큰 값 확인 
+kubeadm join 192.168.10.10:6443 --token mxh567.vq5b67pvo30kh1sc \
+	--discovery-token-ca-cert-hash sha256:713abf30b0502dd416ee44cc8e8a674d8e37b2b4114c515f392595d1cf6de58d
+----------------------------------------------------------------------
+
+<토큰 재발급>
+kubeadm token list
+master  ==> kubeadm token create --print-join-command
+
+
+4.3 CNI "Calico(캘리코)" 설치
+** CNI(Container Network Interface) : Pod 간 통신이 가능하게 하는 인터페이스(표준 사양) 
+
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+curl https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/custom-resources.yaml -O
+kubectl create -f custom-resources.yaml
+
+<<확인명령어 1>>
+kubectl get pods -n kube-system
+----------------------------------------------------------------------------------
+root@master:~# kubectl get pods -n kube-system
+NAME                             READY   STATUS    RESTARTS         AGE
+calico-node-dbjbw                0/1     Running   0                40s
+coredns-7c65d6cfc9-wc8ts         1/1     Running   0                27m
+coredns-7c65d6cfc9-x68p2         1/1     Running   0                27m
+etcd-master                      1/1     Running   14 (5m34s ago)   28m
+kube-apiserver-master            1/1     Running   18 (6m53s ago)   28m
+kube-controller-manager-master   1/1     Running   17 (7m34s ago)   28m
+kube-proxy-jkvlf                 1/1     Running   11 (4m23s ago)   27m
+kube-scheduler-master            1/1     Running   19 (6m37s ago)   28m
+--------------------------------------------------------------------------------
+또는 
+<<확인명령어 2>>
+root@master:~# kubectl get ns
+NAME               STATUS   AGE
+calico-apiserver   Active   4d7h
+calico-system      Active   4d7h
+default            Active   4d7h
+kube-node-lease    Active   4d7h
+kube-public        Active   4d7h
+kube-system        Active   4d7h
+tigera-operator    Active   4d7h
+----------------------------------------------------------------------------------
+
+<<확인명령어 3>>
+root@master:~# kubectl get nodes
+NAME     STATUS   ROLES           AGE   VERSION
+master   Ready    control-plane   27m   v1.31.13
+
+
+5. <Worker Node> Master node와 Worker node join (Cluster 구성) 
+
+kubeadm join 192.168.10.10:6443 --token mxh567.vq5b67pvo30kh1sc \
+	--discovery-token-ca-cert-hash sha256:713abf30b0502dd416ee44cc8e8a674d8e37b2b4114c515f392595d1cf6de58d
+
+<<이전 설정값으로 초기화 시 >>
+kubeadm reset -f
+rm -rf /etc/Kubernetes
+rm -rf /var/lib/etcd
+rm -rf $HOME/.kube
+rm -f /etc/kubernetes/pki/ca.crt
+
+
+6. 오류 발생 시 점검 명령어
+<Node 상태 확인>
+kubectl describe node master
+
+<Kubelet 서비스 점검>
+systemctl status kubelet
+journalctl -xeu kubelet
+systemctl daemon-reload
+systemctl restart kubelet
+
+<CNI (네트워크 플러그인) 확인>
+kubectl get pods -n kube-system
+*calico CNI Pod가 Running 확인
+
+*오류 메세지  : server 192.168.10.10:6443 was refused 
+The connection to the server 192.168.10.10:6443 was refused - did you specify the right host or port? 
+  //Kubernetes API 서버(마스터 노드) 에 접속하지 못하고 있음을 의미
+   systemctl status kubelet
+   netstat -tulnp | grep 6443   
+   //LISTEN 중인지 확인, 만약 없다면 kube-apiserver가 실행되지 않음
+
+   <<kube-apiserver가 실행 중인지 확인>>
+   docker ps | grep kube-apiserver
+   crictl ps | grep kube-apiserver    //아무 출력이 없으면 API 서버 Pod이 죽은 상태
+  * 오류 메세지 kubelet.service: Failed with result 'exit-code
+   systemctl status kubelet -l
+
+해결방안 1> swap 비활성화 
+swapon --show
+swapoff -a
+------------------------------------------
+Swap 영구 비활성화
+nano /etc/fstab
+   /swapfile 혹은 UUID= ==> 주석처리 
+----------------------------------------------
+
+systemctl daemon-reload
+systemctl restart kubelet
+systemctl status kubelet -l
+
+해결방안 2) containerd 서비스 점검
+systemctl status containerd
+journalctl -xeu containerd
+systemctl restart containerd
+
+해결방안 3> cgroup 설정 불일치 
+nano /etc/containerd/config.toml
+ [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+  SystemdCgroup = true   //추가 설정 
+systemctl restart containerd
+
+cat /var/lib/kubelet/config.yaml | grep -i cgroupDriver
+cgroupDriver: systemd    //설정 값 확인 
+ systemctl restart kubelet
+
+
+
+
+
+
+
